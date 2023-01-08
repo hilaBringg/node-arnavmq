@@ -2,6 +2,33 @@ const amqp = require('amqplib');
 const assert = require('assert');
 const packageVersion = require('../../package.json').version;
 
+const DEFAULT_CHANNEL = Symbol('DEFAULT_CHANNEL');
+
+class ChannelError extends Error {}
+
+class ChannelAlreadyExistError extends ChannelError {}
+
+const getChannelByQueue = (prefetch, queue) => {
+  if (prefetch && queue) {
+    return queue;
+  }
+  return DEFAULT_CHANNEL;
+};
+
+const getPrefetchFromChannelOptions = (channelOptions) => {
+  if (channelOptions && channelOptions.prefetch) {
+    return channelOptions.prefetch;
+  }
+  return null;
+};
+
+const getChannelOptions = (options) => {
+  if (options) {
+    return options.channel;
+  }
+  return undefined;
+};
+
 class Connection {
   constructor(config) {
     this._config = config;
@@ -25,7 +52,7 @@ class Connection {
     // prepare the connection internal object, and reset channel if connection has been closed
     this.connections[url] = {
       conn: null,
-      channel: null
+      channels: { [DEFAULT_CHANNEL]: null }
     };
     connection = this.connections[url];
     connection.conn = amqp.connect(url, {
@@ -51,32 +78,44 @@ class Connection {
   }
 
   /**
-   * Create the channel on the broker, once connection is successfuly opened.
-   * Since RabbitMQ advise to open one channel by process and node is mono-core, we keep only 1 channel for the whole connection.
+   * Create the channel on the broker, once connection is successfully opened.
+   * By default, since RabbitMQ advise to open one channel by process and node is mono-core, we keep only 1 channel for the whole connection.
+   * If prefetch was given in options.channel.prefetch, it create a different channels per queue with the given prefetch.
    * @return {Promise} A promise that resolve with an amqp.node channel object
   */
-  getChannel() {
+  getChannel(queue, options) {
     const url = this._config.host;
-    const { prefetch } = this._config;
     const connection = this.connections[url];
+    const channelOptions = getChannelOptions(options);
+    const prefetch = channelOptions ? channelOptions.prefetch : undefined;
+    const channelToUse = getChannelByQueue(prefetch, queue);
 
     // cache handling, if channel already opened, return it
-    if (connection && connection.chann) {
-      return Promise.resolve(connection.chann);
+    if (connection && connection.channels[channelToUse]) {
+      const existingConnection = connection.channels[channelToUse];
+      const existingPrefetch = existingConnection.options && existingConnection.options.prefetch ? existingConnection.options.prefetch : this._config.prefetch;
+      if (prefetch && existingPrefetch !== prefetch) {
+        throw new ChannelAlreadyExistError(`Channel already exist for queue ${queue} with prefetch ${existingPrefetch}`);
+      }
+      return Promise.resolve(connection.channels[channelToUse].channel);
     }
 
-    connection.chann = connection.conn.createChannel()
+    const createdChannel = connection.conn.createChannel()
       .then((channel) => {
-        channel.prefetch(prefetch);
+        channel.prefetch(prefetch || this._config.prefetch);
 
         // on error we remove the channel so the next call will recreate it (auto-reconnect are handled by connection users)
-        channel.on('close', () => { delete connection.chann; });
+        channel.on('close', () => {
+          delete connection.channels[channelToUse].channel;
+          delete connection.channels[channelToUse];
+        });
         channel.on('error', this._onError.bind(this));
 
-        connection.chann = channel;
+        connection.channels[channelToUse] = { channel, options: channelOptions };
         return channel;
       });
-    return connection.chann;
+    connection.channels[channelToUse] = { channel: createdChannel, options: channelOptions };
+    return connection.channels[channelToUse].channel;
   }
 
   /**
@@ -95,8 +134,8 @@ class Connection {
    * Connect to AMQP and create channel
    * @return {Promise} A promise that resolve with an amqp.node channel object
    */
-  get() {
-    return this.getConnection().then(() => this.getChannel());
+  get(queue, options) {
+    return this.getConnection().then(() => this.getChannel(queue, options));
   }
 
   /**
@@ -121,7 +160,15 @@ class Connection {
 
 let instance;
 
-module.exports = (config) => {
+module.exports.getChannelOptions = getChannelOptions;
+module.exports.getChannelToUse = (options, queue) => {
+  const channelOptions = getChannelOptions(options);
+  const prefetch = getPrefetchFromChannelOptions(channelOptions);
+  return getChannelByQueue(prefetch, queue);
+};
+module.exports.ChannelAlreadyExistError = ChannelAlreadyExistError;
+module.exports.DEFAULT_CHANNEL = DEFAULT_CHANNEL;
+module.exports.instance = (config) => {
   assert(instance || config, 'Connection can not be created because config does not exist');
   assert(config.hostname);
   if (!instance) {

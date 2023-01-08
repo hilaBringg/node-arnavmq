@@ -1,12 +1,13 @@
 const parsers = require('./message-parsers');
 const utils = require('./utils');
+const conn = require('./connection');
 
 const loggerAlias = 'arnav_mq:consumer';
 
 class Consumer {
   constructor(connection) {
     this._connection = connection;
-    this.channel = null;
+    this.channels = { [conn.DEFAULT_CHANNEL]: null };
   }
 
   set connection(value) {
@@ -37,11 +38,26 @@ class Consumer {
           message: `${loggerAlias} [${queue}][${msg.properties.replyTo}] > ${content}`,
           params: { content }
         });
-        this.channel.sendToQueue(msg.properties.replyTo, parsers.out(content, options), options);
+        if (!this.channels[conn.DEFAULT_CHANNEL]) {
+          this.initDefaultChannel().then((channel) => { channel.sendToQueue(msg.properties.replyTo, parsers.out(content, options), options); });
+        } else {
+          this.channels[conn.DEFAULT_CHANNEL].sendToQueue(msg.properties.replyTo, parsers.out(content, options), options);
+        }
       }
 
       return msg;
     };
+  }
+
+  initDefaultChannel() {
+    return this._connection.get().then((channel) => {
+      this.channels[conn.DEFAULT_CHANNEL] = channel;
+      this.channels[conn.DEFAULT_CHANNEL].addListener('close', () => {
+        this.initDefaultChannel();
+      });
+      return channel;
+    }).catch(() => utils.timeoutPromise(this._connection.config.timeout)
+      .then(() => this.initDefaultChannel()));
   }
 
   /**
@@ -58,32 +74,39 @@ class Consumer {
   }
 
   subscribe(queue, options, callback) {
+    const defaultOptions = { persistent: true, durable: true };
+
     if (typeof options === 'function') {
       callback = options;
       // default message options
-      options = { persistent: true, durable: true };
+      options = defaultOptions;
+    } else {
+      options = { ...defaultOptions, ...options };
     }
 
     // consumer gets a suffix if one is set on the configuration, to suffix all queues names
     // ex: service-something with suffix :ci becomes service-suffix:ci etc.
     const suffixedQueue = `${queue}${this._connection.config.consumerSuffix || ''}`;
 
-    return this._connection.get().then((channel) => {
-      this.channel = channel;
+    return this._connection.get(queue, options).then((channel) => {
+      const channelToUse = conn.getChannelToUse(options, queue);
+      this.channels[channelToUse] = channel;
 
       // when channel is closed, we want to be sure we recreate the queue ASAP so we trigger a reconnect by recreating the consumer
-      this.channel.addListener('close', () => {
+      this.channels[channelToUse].addListener('close', () => {
         this.subscribe(queue, options, callback);
       });
 
-      return this.channel.assertQueue(suffixedQueue, options).then((q) => {
+      delete options.channel;
+
+      return this.channels[channelToUse].assertQueue(suffixedQueue, options).then((q) => {
         this._connection.config.transport.debug(loggerAlias, 'init', q.queue);
         this._connection.config.logger.debug({
           message: `${loggerAlias} init ${q.queue}`,
           params: { queue: q.queue }
         });
 
-        this.channel.consume(q.queue, (msg) => {
+        this.channels[channelToUse].consume(q.queue, (msg) => {
           const messageString = msg.content.toString();
           this._connection.config.transport.debug(loggerAlias, `[${q.queue}] < ${messageString}`);
           this._connection.config.logger.debug({
@@ -97,7 +120,7 @@ class Consumer {
             .then((body) => callback(body, msg.properties))
             .then(this.checkRpc(msg, q.queue))
             .then(() => {
-              this.channel.ack(msg);
+              this.channels[channelToUse].ack(msg);
             })
             .catch((error) => {
               // if something bad happened in the callback, reject the message so we can requeue it (or not)
@@ -108,15 +131,21 @@ class Consumer {
                 params: { queue: q.queue, message: messageString }
               });
 
-              this.channel.reject(msg, this._connection.config.requeue);
+              this.channels[channelToUse].reject(msg, this._connection.config.requeue);
             });
         }, { noAck: false });
 
         return true;
       });
       // in case of any error creating the channel, wait for some time and then try to reconnect again (to avoid overflow)
-    }).catch(() => utils.timeoutPromise(this._connection.config.timeout)
-      .then(() => this.subscribe(queue, options, callback)));
+    }).catch((e) => {
+      if (e instanceof conn.ChannelAlreadyExistError) {
+        throw e;
+      } else {
+        utils.timeoutPromise(this._connection.config.timeout)
+          .then(() => this.subscribe(queue, options, callback));
+      }
+    });
   }
 }
 
